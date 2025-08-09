@@ -37,6 +37,15 @@ variable "factorio_port" {
   type    = number
   default = 34197
 }
+variable "healthcheck_port" {
+  type    = number
+  default = 12345
+}
+variable "domain_name" {
+  type    = string
+  default = "mattpchoy.com"
+}
+
 # ---------- Networking ----------
 data "aws_availability_zones" "azs" {}
 
@@ -55,7 +64,7 @@ resource "aws_internet_gateway" "igw" {
 resource "aws_subnet" "public" {
   count                   = 1
   vpc_id                  = aws_vpc.main.id
-  cidr_block = cidrsubnet(aws_vpc.main.cidr_block, 8, 0)
+  cidr_block              = cidrsubnet(aws_vpc.main.cidr_block, 8, 0)
   map_public_ip_on_launch = true
   availability_zone       = data.aws_availability_zones.azs.names[0]
   tags = { Name = "${var.project_name}-public-${count.index}" }
@@ -82,7 +91,6 @@ resource "aws_security_group" "ecs_sg" {
   vpc_id      = aws_vpc.main.id
   description = "Allow Factorio UDP port and control access"
 
-  # Factorio UDP port open to the world (adjust as required)
   ingress {
     description      = "Factorio UDP"
     from_port        = var.factorio_port
@@ -92,11 +100,10 @@ resource "aws_security_group" "ecs_sg" {
     ipv6_cidr_blocks = ["::/0"]
   }
 
-  # (Optional) allow health checks (TCP) from the NLB's healthcheck — NLB uses ephemeral source, allow all outbound/ingress for TCP healthcheck
   ingress {
     description = "TCP healthcheck"
-    from_port   = var.factorio_port
-    to_port     = var.factorio_port
+    from_port   = var.healthcheck_port
+    to_port     = var.healthcheck_port
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
@@ -142,15 +149,12 @@ resource "aws_cloudwatch_log_group" "factorio" {
   retention_in_days = 14
 }
 
-# ---------- ECS Task Definition ----------
-# NOTE: This example uses the community image "factoriotools/factorio:latest".
-# If the image requires additional configuration (licenses, save files), mount a volume or EFS as needed.
+# ---------- ECS Task Definition with TCP sidecar ----------
 locals {
   container_definitions = jsonencode([
     {
       name  = "factorio"
       image = "factoriotools/factorio:2.0.60"
-      # The container must expose the UDP port for Factorio multiplayer
       portMappings = [
         {
           containerPort = var.factorio_port
@@ -166,7 +170,21 @@ locals {
           "awslogs-stream-prefix" = "factorio"
         }
       }
-      # Adjust env / mountPoints / command as required by the specific image/version
+    },
+    {
+      name  = "tcp-healthcheck"
+      image = "hashicorp/http-echo"
+      command = [
+        "-listen", ":${var.healthcheck_port}",
+        "-text=OK"
+      ]
+      portMappings = [
+        {
+          containerPort = var.healthcheck_port
+          protocol      = "tcp"
+        }
+      ]
+      essential = false
     }
   ])
 }
@@ -191,7 +209,6 @@ resource "aws_lb" "nlb" {
   tags = { Name = "${var.project_name}-nlb" }
 }
 
-# Target group -> UDP protocol, target_type = "ip" for Fargate
 resource "aws_lb_target_group" "factorio_udp_tg" {
   name        = "${var.project_name}-udp-tg"
   port        = var.factorio_port
@@ -199,11 +216,10 @@ resource "aws_lb_target_group" "factorio_udp_tg" {
   vpc_id      = aws_vpc.main.id
   target_type = "ip"
 
-  # NLB health checks for UDP need to be TCP/HTTP; use TCP health check against same port.
   health_check {
     enabled             = true
     protocol            = "TCP"
-    port                = tostring(var.factorio_port)
+    port                = tostring(var.healthcheck_port)
     healthy_threshold   = 2
     unhealthy_threshold = 2
     interval            = 10
@@ -270,8 +286,6 @@ NLB connect:
 - Use the NLB DNS name (${aws_lb.nlb.dns_name}) and UDP port ${var.factorio_port}.
 
 Security:
-- This example opens UDP 34197 to the world. Lock to your IP ranges for safety.
+- This example opens UDP 34197 and TCP ${var.healthcheck_port} to the world. Lock to your IP ranges for safety.
 EOT
 }
-
-
